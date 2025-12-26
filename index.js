@@ -1,7 +1,7 @@
 // ==========================================
-// BISCA ONLINE - SERVIDOR MULTIPLAYER v2.0
+// BISCA ONLINE - SERVIDOR MULTIPLAYER v2.1
 // Node.js + Socket.io
-// CORREÇÕES: Bot substituto, vitória/derrota, revanche
+// CORREÇÕES: Contador online real, bot substituto
 // ==========================================
 
 const express = require('express');
@@ -35,6 +35,12 @@ const POWER = { '2': 0, '3': 1, '4': 2, '5': 3, '6': 4, 'Q': 5, 'J': 6, 'K': 7, 
 
 const rooms = new Map();
 const playerRooms = new Map();
+let onlinePlayersCount = 0; // Contador real de jogadores
+
+// Função para enviar contagem de jogadores para todos
+function broadcastOnlineCount() {
+  io.emit('online_count', { count: onlinePlayersCount });
+}
 
 // ==========================================
 // CLASSE DO JOGO
@@ -55,6 +61,7 @@ class GameRoom {
     this.winner = null;
     this.rematchRequests = new Set();
     this.hasBot = false;
+    this.isProcessingPlay = false; // Flag para evitar jogadas múltiplas
   }
 
   isFull() {
@@ -92,7 +99,6 @@ class GameRoom {
     return this.players.find(p => p.socketId !== socketId);
   }
 
-  // Adiciona um bot quando jogador sai
   addBotReplacement(oldSocketId, oldHand, oldPoints) {
     const botId = 'bot_' + Math.random().toString(36).substr(2, 9);
     
@@ -107,12 +113,10 @@ class GameRoom {
     this.points[botId] = oldPoints || 0;
     this.hasBot = true;
     
-    // Se era a vez do jogador que saiu, passa pro bot
     if (this.currentTurn === oldSocketId) {
       this.currentTurn = botId;
     }
     
-    // Atualiza referências na mesa
     if (this.table.cards[oldSocketId]) {
       this.table.cards[botId] = this.table.cards[oldSocketId];
       delete this.table.cards[oldSocketId];
@@ -150,6 +154,7 @@ class GameRoom {
     this.deck = this.createDeck();
     this.trunfo = this.deck.pop();
     this.trunfoSuit = this.trunfo.suit;
+    this.isProcessingPlay = false;
     
     this.players.forEach(player => {
       this.hands[player.socketId] = [
@@ -170,12 +175,20 @@ class GameRoom {
   }
 
   playCard(socketId, cardId) {
+    // Bloqueia se já está processando uma jogada
+    if (this.isProcessingPlay) {
+      return { success: false, error: 'Aguarde...' };
+    }
+    
     if (this.phase !== 'playing') return { success: false, error: 'Jogo não está em andamento' };
     if (this.currentTurn !== socketId) return { success: false, error: 'Não é sua vez' };
     
     const hand = this.hands[socketId];
     const cardIndex = hand.findIndex(c => c.id === cardId);
     if (cardIndex === -1) return { success: false, error: 'Carta não encontrada' };
+    
+    // Ativa o bloqueio
+    this.isProcessingPlay = true;
     
     const card = hand.splice(cardIndex, 1)[0];
     this.table.cards[socketId] = card;
@@ -191,10 +204,17 @@ class GameRoom {
     const opponent = this.getOpponent(socketId);
     this.currentTurn = opponent.socketId;
     
+    // Libera o bloqueio para o próximo jogador
+    this.isProcessingPlay = false;
+    
     return { success: true, roundComplete: false };
   }
 
-  // Bot joga automaticamente
+  // Liberar bloqueio após rodada
+  unlockPlay() {
+    this.isProcessingPlay = false;
+  }
+
   botPlay() {
     const bot = this.players.find(p => p.isBot);
     if (!bot || this.currentTurn !== bot.socketId) return null;
@@ -207,13 +227,11 @@ class GameRoom {
     const trumpSuit = this.trunfoSuit;
 
     if (!leadCard) {
-      // Bot é o primeiro a jogar - joga carta fraca
       const nonTrumps = hand.filter(c => c.suit !== trumpSuit);
       cardToPlay = nonTrumps.length > 0 
         ? nonTrumps.sort((a,b) => a.power - b.power)[0] 
         : hand.sort((a,b) => a.power - b.power)[0];
     } else {
-      // Bot responde - tenta ganhar se vale a pena
       const winnable = hand.filter(my => {
         if (leadCard.suit === trumpSuit && my.suit === trumpSuit && my.power > leadCard.power) return true;
         if (leadCard.suit !== trumpSuit && my.suit === trumpSuit) return true;
@@ -288,7 +306,6 @@ class GameRoom {
   drawCards(winnerId) {
     const drawn = {};
     
-    // Encontra a ordem correta (vencedor primeiro)
     const winnerPlayer = this.players.find(p => p.socketId === winnerId);
     const otherPlayer = this.players.find(p => p.socketId !== winnerId);
     
@@ -360,10 +377,8 @@ class GameRoom {
   requestRematch(socketId) {
     this.rematchRequests.add(socketId);
     
-    // Se os dois pediram, reinicia
     const humanPlayers = this.players.filter(p => !p.isBot);
     if (humanPlayers.length === 1 && this.hasBot) {
-      // Só tem 1 humano + bot, pode reiniciar direto
       return { accepted: true };
     }
     
@@ -379,7 +394,6 @@ class GameRoom {
     const myPoints = this.points[socketId] || 0;
     const opponentPoints = opponent ? (this.points[opponent.socketId] || 0) : 0;
     
-    // Determinar resultado correto
     let gameResult = null;
     if (this.phase === 'finished') {
       if (this.winner === 'draw') {
@@ -408,7 +422,7 @@ class GameRoom {
         opponentCard: opponent ? (this.table.cards[opponent.socketId] || null) : null,
         iAmLead: this.table.lead === socketId
       },
-      isMyTurn: this.currentTurn === socketId,
+      isMyTurn: this.currentTurn === socketId && !this.isProcessingPlay,
       winner: this.winner,
       gameResult,
       rematchRequests: Array.from(this.rematchRequests),
@@ -438,7 +452,6 @@ function findOrCreateRoom() {
   return room;
 }
 
-// Função para bot jogar com delay
 function scheduleBotPlay(room, io) {
   const bot = room.players.find(p => p.isBot);
   if (!bot || room.currentTurn !== bot.socketId || room.phase !== 'playing') return;
@@ -449,7 +462,6 @@ function scheduleBotPlay(room, io) {
     const result = room.botPlay();
     if (!result || !result.success) return;
     
-    // Notifica o jogador humano
     const human = room.players.find(p => !p.isBot);
     if (human) {
       io.to(human.socketId).emit('card_played', room.getStateForPlayer(human.socketId));
@@ -458,6 +470,8 @@ function scheduleBotPlay(room, io) {
     if (result.roundComplete) {
       setTimeout(() => {
         const roundResult = room.resolveRound();
+        room.unlockPlay(); // Libera bloqueio após resolver rodada
+        
         if (roundResult) {
           if (human) {
             io.to(human.socketId).emit('round_result', {
@@ -487,14 +501,12 @@ function scheduleBotPlay(room, io) {
                 });
               }
             } else {
-              // Se for vez do bot de novo, agenda próxima jogada
               scheduleBotPlay(room, io);
             }
           }, 1000);
         }
       }, 1500);
     } else {
-      // Não completou rodada, verifica se é vez do bot de novo
       scheduleBotPlay(room, io);
     }
   }, 1200);
@@ -506,6 +518,18 @@ function scheduleBotPlay(room, io) {
 
 io.on('connection', (socket) => {
   console.log(`🟢 Jogador conectado: ${socket.id}`);
+  
+  // Incrementa contador e notifica todos
+  onlinePlayersCount++;
+  broadcastOnlineCount();
+  
+  // Envia contagem atual para o novo jogador
+  socket.emit('online_count', { count: onlinePlayersCount });
+
+  // PEDIR CONTAGEM DE JOGADORES ONLINE
+  socket.on('get_online_count', () => {
+    socket.emit('online_count', { count: onlinePlayersCount });
+  });
 
   // MATCHMAKING
   socket.on('find_match', (data) => {
@@ -531,7 +555,6 @@ io.on('connection', (socket) => {
         }
       });
       
-      // Se bot começa, agenda jogada
       scheduleBotPlay(room, io);
       
       console.log(`🎮 Partida iniciada na sala ${room.roomId}`);
@@ -605,7 +628,6 @@ io.on('connection', (socket) => {
       return;
     }
     
-    // Notificar jogadores
     room.players.forEach(player => {
       if (!player.isBot) {
         io.to(player.socketId).emit('card_played', room.getStateForPlayer(player.socketId));
@@ -615,6 +637,7 @@ io.on('connection', (socket) => {
     if (result.roundComplete) {
       setTimeout(() => {
         const roundResult = room.resolveRound();
+        room.unlockPlay(); // Libera bloqueio após resolver rodada
         
         if (roundResult) {
           room.players.forEach(player => {
@@ -651,14 +674,12 @@ io.on('connection', (socket) => {
                 }
               });
             } else {
-              // Se for vez do bot, agenda jogada
               scheduleBotPlay(room, io);
             }
           }, 1000);
         }
       }, 1500);
     } else {
-      // Se for vez do bot, agenda jogada
       scheduleBotPlay(room, io);
     }
   });
@@ -684,7 +705,6 @@ io.on('connection', (socket) => {
       scheduleBotPlay(room, io);
       console.log(`🔄 Revanche na sala ${roomId}`);
     } else {
-      // Notifica o oponente que você pediu revanche
       const opponent = room.getOpponent(socket.id);
       if (opponent && !opponent.isBot) {
         io.to(opponent.socketId).emit('rematch_requested', {
@@ -698,6 +718,10 @@ io.on('connection', (socket) => {
 
   // DESCONEXÃO
   socket.on('disconnect', () => {
+    // Decrementa contador e notifica todos
+    onlinePlayersCount = Math.max(0, onlinePlayersCount - 1);
+    broadcastOnlineCount();
+    
     const roomId = playerRooms.get(socket.id);
     
     if (roomId) {
@@ -708,7 +732,6 @@ io.on('connection', (socket) => {
         const opponent = room.getOpponent(socket.id);
         
         if (opponent && !opponent.isBot && room.phase === 'playing') {
-          // Jogo em andamento - substitui por bot
           const oldHand = room.hands[socket.id] || [];
           const oldPoints = room.points[socket.id] || 0;
           
@@ -721,12 +744,10 @@ io.on('connection', (socket) => {
           
           io.to(opponent.socketId).emit('game_state_update', room.getStateForPlayer(opponent.socketId));
           
-          // Se for vez do bot, joga
           scheduleBotPlay(room, io);
           
           console.log(`🤖 Bot substituiu jogador na sala ${roomId}`);
         } else if (opponent && !opponent.isBot) {
-          // Jogo não iniciado ou já acabou
           io.to(opponent.socketId).emit('opponent_disconnected', {
             message: 'Seu oponente desconectou.'
           });
@@ -745,7 +766,7 @@ io.on('connection', (socket) => {
       playerRooms.delete(socket.id);
     }
     
-    console.log(`🔴 Jogador desconectado: ${socket.id}`);
+    console.log(`🔴 Jogador desconectado: ${socket.id} | Online: ${onlinePlayersCount}`);
   });
 
   // CHAT
@@ -769,9 +790,9 @@ io.on('connection', (socket) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    game: 'Bisca Multiplayer v2.0',
+    game: 'Bisca Multiplayer v2.1',
     rooms: rooms.size,
-    players: playerRooms.size
+    players: onlinePlayersCount
   });
 });
 
@@ -788,9 +809,14 @@ app.get('/stats', (req, res) => {
   
   res.json({
     totalRooms: rooms.size,
-    totalPlayers: playerRooms.size,
+    totalPlayers: onlinePlayersCount,
     rooms: roomStats
   });
+});
+
+// Endpoint para obter contagem de jogadores (para o menu)
+app.get('/online', (req, res) => {
+  res.json({ count: onlinePlayersCount });
 });
 
 // ==========================================
@@ -802,12 +828,12 @@ const PORT = process.env.PORT || 10000;
 httpServer.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════╗
-║     🃏 BISCA ONLINE - SERVIDOR v2.0 🃏   ║
+║     🃏 BISCA ONLINE - SERVIDOR v2.1 🃏   ║
 ╠══════════════════════════════════════════╣
 ║  Status: ONLINE                          ║
 ║  Porta: ${PORT}                            ║
 ║  WebSocket: Ativo                        ║
-║  Bot Substituto: Ativo                   ║
+║  Contador Online: Ativo                  ║
 ╚══════════════════════════════════════════╝
   `);
 });
