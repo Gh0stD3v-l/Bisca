@@ -1,16 +1,19 @@
 // ==========================================
-// BISCA ONLINE - SERVIDOR MULTIPLAYER v2.1
+// BISCA ONLINE - SERVIDOR MULTIPLAYER v2.2
 // Node.js + Socket.io
-// CORREÇÕES: Contador online real, bot substituto
+// CORREÇÕES: Revanche, Chat melhorado, Filtro palavrões, Denúncias
 // ==========================================
 
 const express = require('express');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
@@ -29,15 +32,110 @@ const RANKS = ['2', '3', '4', '5', '6', 'Q', 'J', 'K', '7', 'A'];
 const VALUES = { '2': 0, '3': 0, '4': 0, '5': 0, '6': 0, 'Q': 2, 'J': 3, 'K': 4, '7': 10, 'A': 11 };
 const POWER = { '2': 0, '3': 1, '4': 2, '5': 3, '6': 4, 'Q': 5, 'J': 6, 'K': 7, '7': 8, 'A': 9 };
 
+// Lista de palavrões para filtro (adicione mais conforme necessário)
+const PALAVROES = [
+  'porra', 'caralho', 'puta', 'merda', 'foda', 'fodase', 'fodasse', 'foder',
+  'cu', 'cuzao', 'cuzão', 'arrombado', 'viado', 'viada', 'gay', 'bosta',
+  'desgraça', 'desgraçado', 'filho da puta', 'fdp', 'pqp', 'vsf', 'vtnc',
+  'otario', 'otário', 'idiota', 'imbecil', 'retardado', 'burro', 'lixo',
+  'babaca', 'corno', 'vagabundo', 'vagabunda', 'piranha', 'prostituta',
+  'buceta', 'boceta', 'rola', 'pau', 'cacete', 'boquete', 'punheta'
+];
+
 // ==========================================
 // ESTADO DO SERVIDOR
 // ==========================================
 
 const rooms = new Map();
 const playerRooms = new Map();
-let onlinePlayersCount = 0; // Contador real de jogadores
+const playerNames = new Map(); // socketId -> nome
+let onlinePlayersCount = 0;
 
-// Função para enviar contagem de jogadores para todos
+// Armazenar denúncias e logs de chat
+const reports = [];
+const chatLogs = new Map(); // roomId -> array de mensagens
+
+// ==========================================
+// FUNÇÕES DE FILTRO E DENÚNCIA
+// ==========================================
+
+function containsPalavrao(text) {
+  const lowerText = text.toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // Remove acentos
+    .replace(/[^a-z0-9\s]/g, ''); // Remove caracteres especiais
+  
+  for (const palavrao of PALAVROES) {
+    const normalizedPalavrao = palavrao
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '');
+    
+    if (lowerText.includes(normalizedPalavrao)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function censorMessage(text) {
+  let censored = text;
+  const lowerText = text.toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+  
+  for (const palavrao of PALAVROES) {
+    const normalizedPalavrao = palavrao
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '');
+    
+    const regex = new RegExp(normalizedPalavrao, 'gi');
+    if (regex.test(lowerText)) {
+      // Substitui por asteriscos
+      const asterisks = '*'.repeat(palavrao.length);
+      censored = censored.replace(new RegExp(palavrao, 'gi'), asterisks);
+    }
+  }
+  return censored;
+}
+
+function saveReport(report) {
+  reports.push({
+    ...report,
+    id: Date.now(),
+    timestamp: new Date().toISOString(),
+    status: 'pending' // pending, reviewed, resolved
+  });
+  
+  // Salvar em arquivo (persistência básica)
+  try {
+    fs.writeFileSync(
+      path.join(__dirname, 'reports.json'),
+      JSON.stringify(reports, null, 2)
+    );
+  } catch (err) {
+    console.error('Erro ao salvar denúncia:', err);
+  }
+  
+  console.log(`🚨 Nova denúncia registrada: ${report.type} - ${report.reportedPlayer}`);
+}
+
+function loadReports() {
+  try {
+    const data = fs.readFileSync(path.join(__dirname, 'reports.json'), 'utf8');
+    return JSON.parse(data);
+  } catch (err) {
+    return [];
+  }
+}
+
+// Carregar denúncias existentes
+const existingReports = loadReports();
+reports.push(...existingReports);
+
+// ==========================================
+// BROADCAST
+// ==========================================
+
 function broadcastOnlineCount() {
   io.emit('online_count', { count: onlinePlayersCount });
 }
@@ -61,7 +159,8 @@ class GameRoom {
     this.winner = null;
     this.rematchRequests = new Set();
     this.hasBot = false;
-    this.isProcessingPlay = false; // Flag para evitar jogadas múltiplas
+    this.isProcessingPlay = false;
+    this.chatHistory = []; // Histórico do chat da sala
   }
 
   isFull() {
@@ -169,13 +268,12 @@ class GameRoom {
     this.phase = 'playing';
     this.table = { cards: {}, lead: null };
     this.winner = null;
-    this.rematchRequests.clear();
+    this.rematchRequests.clear(); // Limpa pedidos de revanche
     
     return true;
   }
 
   playCard(socketId, cardId) {
-    // Bloqueia se já está processando uma jogada
     if (this.isProcessingPlay) {
       return { success: false, error: 'Aguarde...' };
     }
@@ -187,7 +285,6 @@ class GameRoom {
     const cardIndex = hand.findIndex(c => c.id === cardId);
     if (cardIndex === -1) return { success: false, error: 'Carta não encontrada' };
     
-    // Ativa o bloqueio
     this.isProcessingPlay = true;
     
     const card = hand.splice(cardIndex, 1)[0];
@@ -204,13 +301,11 @@ class GameRoom {
     const opponent = this.getOpponent(socketId);
     this.currentTurn = opponent.socketId;
     
-    // Libera o bloqueio para o próximo jogador
     this.isProcessingPlay = false;
     
     return { success: true, roundComplete: false };
   }
 
-  // Liberar bloqueio após rodada
   unlockPlay() {
     this.isProcessingPlay = false;
   }
@@ -378,15 +473,29 @@ class GameRoom {
     this.rematchRequests.add(socketId);
     
     const humanPlayers = this.players.filter(p => !p.isBot);
+    
+    // Se só tem 1 humano + bot, aceita direto
     if (humanPlayers.length === 1 && this.hasBot) {
       return { accepted: true };
     }
     
+    // Se os dois jogadores pediram revanche
     if (this.rematchRequests.size >= 2) {
       return { accepted: true };
     }
     
     return { accepted: false, waiting: true };
+  }
+
+  // Método para aceitar revanche do oponente
+  acceptRematch(socketId) {
+    this.rematchRequests.add(socketId);
+    
+    if (this.rematchRequests.size >= 2) {
+      return { accepted: true };
+    }
+    
+    return { accepted: false };
   }
 
   getStateForPlayer(socketId) {
@@ -426,7 +535,8 @@ class GameRoom {
       winner: this.winner,
       gameResult,
       rematchRequests: Array.from(this.rematchRequests),
-      hasBot: this.hasBot
+      hasBot: this.hasBot,
+      opponentWantsRematch: opponent ? this.rematchRequests.has(opponent.socketId) : false
     };
   }
 }
@@ -470,7 +580,7 @@ function scheduleBotPlay(room, io) {
     if (result.roundComplete) {
       setTimeout(() => {
         const roundResult = room.resolveRound();
-        room.unlockPlay(); // Libera bloqueio após resolver rodada
+        room.unlockPlay();
         
         if (roundResult) {
           if (human) {
@@ -519,14 +629,10 @@ function scheduleBotPlay(room, io) {
 io.on('connection', (socket) => {
   console.log(`🟢 Jogador conectado: ${socket.id}`);
   
-  // Incrementa contador e notifica todos
   onlinePlayersCount++;
   broadcastOnlineCount();
-  
-  // Envia contagem atual para o novo jogador
   socket.emit('online_count', { count: onlinePlayersCount });
 
-  // PEDIR CONTAGEM DE JOGADORES ONLINE
   socket.on('get_online_count', () => {
     socket.emit('online_count', { count: onlinePlayersCount });
   });
@@ -534,6 +640,7 @@ io.on('connection', (socket) => {
   // MATCHMAKING
   socket.on('find_match', (data) => {
     const playerName = data?.name || 'Anônimo';
+    playerNames.set(socket.id, playerName);
     console.log(`🔍 ${playerName} procurando partida...`);
     
     const room = findOrCreateRoom();
@@ -556,7 +663,6 @@ io.on('connection', (socket) => {
       });
       
       scheduleBotPlay(room, io);
-      
       console.log(`🎮 Partida iniciada na sala ${room.roomId}`);
     } else {
       socket.emit('waiting_opponent', { roomId: room.roomId });
@@ -566,6 +672,7 @@ io.on('connection', (socket) => {
   // CRIAR SALA PRIVADA
   socket.on('create_private_room', (data) => {
     const playerName = data?.name || 'Anfitrião';
+    playerNames.set(socket.id, playerName);
     const roomId = generateRoomId();
     const room = new GameRoom(roomId);
     
@@ -582,6 +689,7 @@ io.on('connection', (socket) => {
   socket.on('join_private_room', (data) => {
     const { roomId, name } = data;
     const playerName = name || 'Convidado';
+    playerNames.set(socket.id, playerName);
     const room = rooms.get(roomId);
     
     if (!room) {
@@ -637,7 +745,7 @@ io.on('connection', (socket) => {
     if (result.roundComplete) {
       setTimeout(() => {
         const roundResult = room.resolveRound();
-        room.unlockPlay(); // Libera bloqueio após resolver rodada
+        room.unlockPlay();
         
         if (roundResult) {
           room.players.forEach(player => {
@@ -693,11 +801,21 @@ io.on('connection', (socket) => {
     
     const result = room.requestRematch(socket.id);
     
+    // Notifica o oponente que pedimos revanche
+    const opponent = room.getOpponent(socket.id);
+    if (opponent && !opponent.isBot) {
+      io.to(opponent.socketId).emit('rematch_requested', {
+        from: room.players.find(p => p.socketId === socket.id)?.name || 'Oponente'
+      });
+    }
+    
     if (result.accepted) {
+      // Reinicia o jogo!
       room.startGame();
       
       room.players.forEach(player => {
         if (!player.isBot) {
+          io.to(player.socketId).emit('rematch_accepted');
           io.to(player.socketId).emit('game_start', room.getStateForPlayer(player.socketId));
         }
       });
@@ -705,20 +823,130 @@ io.on('connection', (socket) => {
       scheduleBotPlay(room, io);
       console.log(`🔄 Revanche na sala ${roomId}`);
     } else {
-      const opponent = room.getOpponent(socket.id);
-      if (opponent && !opponent.isBot) {
-        io.to(opponent.socketId).emit('rematch_requested', {
-          from: room.players.find(p => p.socketId === socket.id)?.name || 'Oponente'
-        });
-      }
-      
       socket.emit('rematch_waiting', { message: 'Aguardando oponente aceitar revanche...' });
     }
   });
 
+  // ACEITAR REVANCHE (novo evento)
+  socket.on('accept_rematch', () => {
+    const roomId = playerRooms.get(socket.id);
+    const room = rooms.get(roomId);
+    
+    if (!room) return;
+    
+    const result = room.acceptRematch(socket.id);
+    
+    if (result.accepted) {
+      room.startGame();
+      
+      room.players.forEach(player => {
+        if (!player.isBot) {
+          io.to(player.socketId).emit('rematch_accepted');
+          io.to(player.socketId).emit('game_start', room.getStateForPlayer(player.socketId));
+        }
+      });
+      
+      scheduleBotPlay(room, io);
+      console.log(`🔄 Revanche aceita na sala ${roomId}`);
+    }
+  });
+
+  // CHAT COM FILTRO DE PALAVRÕES
+  socket.on('chat_message', (data) => {
+    const roomId = playerRooms.get(socket.id);
+    if (!roomId) return;
+    
+    const room = rooms.get(roomId);
+    const player = room?.players.find(p => p.socketId === socket.id);
+    const playerName = player?.name || 'Anônimo';
+    
+    let message = data.message;
+    let wasCensored = false;
+    
+    // Verifica e censura palavrões
+    if (containsPalavrao(message)) {
+      message = censorMessage(message);
+      wasCensored = true;
+    }
+    
+    // Salva no histórico
+    const chatEntry = {
+      sender: playerName,
+      senderId: socket.id,
+      message: data.message, // Mensagem original (para denúncias)
+      censoredMessage: message,
+      timestamp: new Date().toISOString(),
+      wasCensored
+    };
+    
+    if (!room.chatHistory) room.chatHistory = [];
+    room.chatHistory.push(chatEntry);
+    
+    // Limita histórico a 100 mensagens
+    if (room.chatHistory.length > 100) {
+      room.chatHistory = room.chatHistory.slice(-100);
+    }
+    
+    // Envia mensagem censurada para todos
+    io.to(roomId).emit('chat_message', {
+      sender: playerName,
+      message: message,
+      wasCensored
+    });
+    
+    // Avisa quem enviou que foi censurado
+    if (wasCensored) {
+      socket.emit('message_censored', {
+        warning: 'Sua mensagem continha palavras impróprias e foi censurada.'
+      });
+    }
+  });
+
+  // SISTEMA DE DENÚNCIA
+  socket.on('report_player', (data) => {
+    const roomId = playerRooms.get(socket.id);
+    const room = rooms.get(roomId);
+    
+    if (!room) {
+      socket.emit('report_error', { message: 'Sala não encontrada' });
+      return;
+    }
+    
+    const reporter = room.players.find(p => p.socketId === socket.id);
+    const reported = room.getOpponent(socket.id);
+    
+    if (!reported || reported.isBot) {
+      socket.emit('report_error', { message: 'Não é possível denunciar este jogador' });
+      return;
+    }
+    
+    const report = {
+      type: data.type, // 'palavrao', 'hack', 'outro'
+      reason: data.reason || '',
+      reporterName: reporter?.name || 'Anônimo',
+      reporterId: socket.id,
+      reportedPlayer: reported.name,
+      reportedId: reported.socketId,
+      roomId: roomId,
+      chatHistory: room.chatHistory || [], // Inclui histórico do chat
+      gameState: {
+        myPoints: room.points[socket.id],
+        opponentPoints: room.points[reported.socketId],
+        phase: room.phase
+      }
+    };
+    
+    saveReport(report);
+    
+    socket.emit('report_success', { 
+      message: 'Denúncia enviada com sucesso! Nossa equipe irá analisar.' 
+    });
+    
+    console.log(`🚨 Denúncia: ${reporter?.name} denunciou ${reported.name} por ${data.type}`);
+  });
+
   // DESCONEXÃO
   socket.on('disconnect', () => {
-    // Decrementa contador e notifica todos
     onlinePlayersCount = Math.max(0, onlinePlayersCount - 1);
     broadcastOnlineCount();
     
@@ -766,20 +994,8 @@ io.on('connection', (socket) => {
       playerRooms.delete(socket.id);
     }
     
+    playerNames.delete(socket.id);
     console.log(`🔴 Jogador desconectado: ${socket.id} | Online: ${onlinePlayersCount}`);
-  });
-
-  // CHAT
-  socket.on('chat_message', (data) => {
-    const roomId = playerRooms.get(socket.id);
-    if (roomId) {
-      const room = rooms.get(roomId);
-      const player = room?.players.find(p => p.socketId === socket.id);
-      io.to(roomId).emit('chat_message', {
-        sender: player?.name || 'Anônimo',
-        message: data.message
-      });
-    }
   });
 });
 
@@ -790,7 +1006,7 @@ io.on('connection', (socket) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    game: 'Bisca Multiplayer v2.1',
+    game: 'Bisca Multiplayer v2.2',
     rooms: rooms.size,
     players: onlinePlayersCount
   });
@@ -814,9 +1030,25 @@ app.get('/stats', (req, res) => {
   });
 });
 
-// Endpoint para obter contagem de jogadores (para o menu)
 app.get('/online', (req, res) => {
   res.json({ count: onlinePlayersCount });
+});
+
+// ROTA PARA ADMIN VER DENÚNCIAS (proteger depois com autenticação)
+app.get('/admin/reports', (req, res) => {
+  // Aqui você pode adicionar autenticação básica depois
+  const adminKey = req.query.key;
+  
+  // Chave simples de admin (mude para algo mais seguro depois!)
+  if (adminKey !== 'bisca_admin_2024') {
+    return res.status(401).json({ error: 'Não autorizado' });
+  }
+  
+  res.json({
+    total: reports.length,
+    pending: reports.filter(r => r.status === 'pending').length,
+    reports: reports.slice(-50) // Últimas 50 denúncias
+  });
 });
 
 // ==========================================
@@ -828,12 +1060,13 @@ const PORT = process.env.PORT || 10000;
 httpServer.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════╗
-║     🃏 BISCA ONLINE - SERVIDOR v2.1 🃏   ║
+║     🃏 BISCA ONLINE - SERVIDOR v2.2 🃏   ║
 ╠══════════════════════════════════════════╣
 ║  Status: ONLINE                          ║
 ║  Porta: ${PORT}                            ║
 ║  WebSocket: Ativo                        ║
-║  Contador Online: Ativo                  ║
+║  Filtro Palavrões: Ativo                 ║
+║  Sistema Denúncias: Ativo                ║
 ╚══════════════════════════════════════════╝
   `);
 });
