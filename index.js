@@ -1,7 +1,7 @@
 // ==========================================
-// BISCA ONLINE - SERVIDOR MULTIPLAYER v2.2
+// BISCA ONLINE - SERVIDOR MULTIPLAYER v3.2
 // Node.js + Socket.io
-// CORREÇÕES: Revanche, Chat melhorado, Filtro palavrões, Denúncias
+// FUNCIONALIDADES: Chat, Filtro palavrões, Denúncias, Emojis
 // ==========================================
 
 const express = require('express');
@@ -898,6 +898,23 @@ io.on('connection', (socket) => {
     if (wasCensored) {
       socket.emit('message_censored', {
         warning: 'Sua mensagem continha palavras impróprias e foi censurada.'
+      });
+    }
+  });
+
+  // ENVIAR EMOJI PARA OPONENTE
+  socket.on('send_emoji', (data) => {
+    const roomId = playerRooms.get(socket.id);
+    if (!roomId) return;
+    
+    const room = rooms.get(roomId);
+    if (!room) return;
+    
+    const opponent = room.getOpponent(socket.id);
+    if (opponent && opponent.socketId) {
+      io.to(opponent.socketId).emit('emoji_received', {
+        emojiId: data.emojiId,
+        emoji: data.emoji
       });
     }
   });
